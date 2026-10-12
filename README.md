@@ -30,7 +30,7 @@ Les deux flux se joignent sur `station_id`. Environ 1 500 stations.
 - [x] Kafka en mode KRaft avec Docker Compose (volume persistant + Kafka UI)
 - [x] Test du partitionnement par clé (ordre garanti par station)
 - [x] Producer Python (API Vélib' → Kafka, 1 message par station, clé = `station_id`)
-- [ ] Conteneurisation du producer (Dockerfile + service Docker Compose)
+- [x] Conteneurisation du producer (Dockerfile + service Docker Compose)
 - [ ] Spark Structured Streaming (couche Bronze)
 - [ ] Spark batch (couches Silver / Gold)
 - [ ] Orchestration Airflow
@@ -52,36 +52,36 @@ Les deux flux se joignent sur `station_id`. Environ 1 500 stations.
 - **Résilience** : timeout sur les appels HTTP. Une erreur (réseau, HTTP, JSON invalide, format modifié) est journalisée et le cycle suivant réessaie, sans arrêter le producer.
 - **Configuration par variables d'environnement** (`VELIB_API_URL`, `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC`, `POLL_INTERVAL_SECONDS`) : rien n'est écrit en dur dans le code.
 
+**Conteneurisation**
+- **Dockerfile optimisé pour le cache** : les dépendances sont installées avant la copie du code. Modifier le code ne relance pas `pip install`.
+- **Utilisateur non-root** dans l'image du producer.
+- **Healthcheck sur Kafka** + `depends_on: condition: service_healthy` : le producer ne démarre que lorsque le broker répond réellement.
+- **`restart: unless-stopped`** : le producer est relancé automatiquement en cas de crash imprévu.
+
 ## Lancer le projet
 
-**1. Démarrer Kafka et Kafka UI**
-
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
-Kafka UI : http://localhost:8085
+Cette commande démarre Kafka, Kafka UI et le producer. Le topic `velib-station-status` est créé automatiquement au premier message, avec 3 partitions.
 
-**2. Créer le topic**
+| Service | Accès |
+|---|---|
+| Kafka UI | http://localhost:8085 (**Topics → velib-station-status → Messages**) |
+| Logs du producer | `docker compose logs -f producer` |
 
-```bash
-docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --topic velib-station-status --partitions 3 --replication-factor 1
-```
+Le producer envoie environ 1 500 messages par minute.
 
-**3. Lancer le producer** (dans un conteneur Python, sur le réseau Docker du projet)
-
-```bash
-docker run --rm -it --name velib-producer --network velib-data-pipeline_default -e KAFKA_BOOTSTRAP_SERVERS=kafka:29092 -v "${PWD}/producer:/app" -w /app python:3.12-slim sh -c "pip install -q -r requirements.txt && exec python producer.py"
-```
-
-Le producer envoie environ 1 500 messages par minute. On les voit arriver dans Kafka UI : **Topics → velib-station-status → Messages**.
+Pour tout arrêter : `docker compose down`. Les messages Kafka sont conservés dans le volume `kafka_data`.
 
 ## Structure du projet
 
 ```
 velib-data-pipeline/
-├── docker-compose.yml      # Kafka (KRaft) + Kafka UI
+├── docker-compose.yml      # Kafka (KRaft) + Kafka UI + producer
 ├── producer/
+│   ├── Dockerfile          # Image du producer
 │   ├── producer.py         # API Vélib' → Kafka, toutes les 60 s
 │   ├── test_keys.py        # Démonstration du partitionnement par clé
 │   └── requirements.txt

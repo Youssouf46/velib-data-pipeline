@@ -30,6 +30,13 @@ services:
       KAFKA_NUM_PARTITIONS: 3
       KAFKA_LOG_DIRS: /var/lib/kafka/data    
 
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "kafka:29092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+
 
   kafka-ui:
     image: kafbat/kafka-ui:v1.5.0
@@ -41,6 +48,19 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
     depends_on:
       - kafka
- 
+
+  producer:
+    build: ./producer
+    container_name: velib-producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: velib-station-status
+      POLL_INTERVAL_SECONDS: 60
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+
 volumes:                                       
   kafka_data:
