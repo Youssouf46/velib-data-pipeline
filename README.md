@@ -25,6 +25,14 @@ API open data Vélib' Métropole (format GBFS), sans clé d'API, mise à jour to
 
 Les deux flux se joignent sur `station_id`. Environ 1 500 stations.
 
+### Ce que révèle l'exploration (`spark_jobs/explore_kafka.py`)
+
+Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message perdu) :
+
+- **Seulement 3,6 % de mesures réellement nouvelles** : chaque station publie environ toutes les 28 minutes, alors que l'API est interrogée chaque minute. La couche Silver dédoublonnera sur (`station_id`, `last_reported`). La couche Bronze conserve tout, pour pouvoir rejouer les traitements.
+- **Stations hors service** : 15 en maintenance et 2 non installées au dernier cycle. Elles sont conservées avec un indicateur, pour analyser les pannes, et exclues des calculs de disponibilité.
+- **Traçabilité** : le couple (`partition`, `offset`) identifie de façon unique chaque message Kafka. Il sera conservé en Bronze.
+
 ## Avancement
 
 - [x] Kafka en mode KRaft avec Docker Compose (volume persistant + Kafka UI)
@@ -32,6 +40,7 @@ Les deux flux se joignent sur `station_id`. Environ 1 500 stations.
 - [x] Producer Python (API Vélib' → Kafka, 1 message par station, clé = `station_id`)
 - [x] Conteneurisation du producer (Dockerfile + service Docker Compose)
 - [x] Cluster Spark (1 master + 1 worker) avec connecteur Kafka et Delta Lake
+- [x] Exploration des données Kafka avec PySpark (data profiling)
 - [ ] Spark Structured Streaming (couche Bronze)
 - [ ] Spark batch (couches Silver / Gold)
 - [ ] Orchestration Airflow
@@ -57,7 +66,7 @@ Les deux flux se joignent sur `station_id`. Environ 1 500 stations.
 - **Dockerfile optimisé pour le cache** : les dépendances sont installées avant la copie du code. Modifier le code ne relance pas `pip install`.
 - **Utilisateur non-root** dans l'image du producer.
 - **Healthcheck sur Kafka** + `depends_on: condition: service_healthy` : le producer ne démarre que lorsque le broker répond réellement.
-- **`restart: unless-stopped`** : le producer est relancé automatiquement en cas de crash imprévu.
+- **`restart: unless-stopped` sur tous les services** : ils redémarrent automatiquement après un crash ou un redémarrage de Docker. Au départ, seul le producer avait cette politique : après un redémarrage, il tournait seul, sans Kafka.
 
 **Spark**
 - **Cluster standalone** : un `spark-master` (gestion du cluster + driver des jobs) et un `spark-worker` (2 cœurs, 2 Go pour les executors).
@@ -97,7 +106,8 @@ velib-data-pipeline/
 │   ├── producer.py         # API Vélib' → Kafka, toutes les 60 s
 │   ├── test_keys.py        # Démonstration du partitionnement par clé
 │   └── requirements.txt
-├── spark_jobs/             # Jobs PySpark (à venir)
+├── spark_jobs/
+│   └── explore_kafka.py    # Exploration batch du topic (volume, doublons, état des stations)
 ├── data/                   # Données générées : Bronze / Silver / Gold (non versionné)
 ├── airflow/                # (à venir)
 ├── databricks/             # (à venir)

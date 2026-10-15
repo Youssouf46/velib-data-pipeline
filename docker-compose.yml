@@ -2,6 +2,7 @@ services:
   kafka:
     image: apache/kafka:4.3.1
     container_name: kafka
+    restart: unless-stopped
     ports:
       - "9092:9092"
 
@@ -41,6 +42,7 @@ services:
   kafka-ui:
     image: kafbat/kafka-ui:v1.5.0
     container_name: kafka-ui
+    restart: unless-stopped
     ports:
       - "8085:8080"
     environment:
@@ -65,6 +67,7 @@ services:
   spark-master:
     image: apache/spark:4.0.4-python3
     container_name: spark-master
+    restart: unless-stopped
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     ports:
       - "9090:8080"   # Spark UI du cluster (8080 sera pris par Airflow)
@@ -77,6 +80,7 @@ services:
   spark-worker:
     image: apache/spark:4.0.4-python3
     container_name: spark-worker
+    restart: unless-stopped
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     environment:
       SPARK_WORKER_CORES: 2
