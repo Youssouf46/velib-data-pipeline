@@ -61,6 +61,31 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  
+  spark-master:
+    image: apache/spark:4.0.4-python3
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "9090:8080"   # Spark UI du cluster (8080 sera pris par Airflow)
+      - "4040:4040"   # Spark UI de l'application en cours
+    volumes:
+      - ./spark_jobs:/opt/spark/jobs
+      - ./data:/opt/spark/data
+      - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+
+  spark-worker:
+    image: apache/spark:4.0.4-python3
+    container_name: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+    volumes:
+      - ./data:/opt/spark/data
+    depends_on:
+      - spark-master
+
 
 volumes:                                       
   kafka_data:

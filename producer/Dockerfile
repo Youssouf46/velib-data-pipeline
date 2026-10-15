@@ -7,6 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Dossier de travail dans l'image
 WORKDIR /app
+
 # Sécurité : ne pas exécuter le programme en tant qu'administrateur (root)
 RUN useradd --create-home appuser
 

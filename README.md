@@ -31,6 +31,7 @@ Les deux flux se joignent sur `station_id`. Environ 1 500 stations.
 - [x] Test du partitionnement par clé (ordre garanti par station)
 - [x] Producer Python (API Vélib' → Kafka, 1 message par station, clé = `station_id`)
 - [x] Conteneurisation du producer (Dockerfile + service Docker Compose)
+- [x] Cluster Spark (1 master + 1 worker) avec connecteur Kafka et Delta Lake
 - [ ] Spark Structured Streaming (couche Bronze)
 - [ ] Spark batch (couches Silver / Gold)
 - [ ] Orchestration Airflow
@@ -58,18 +59,27 @@ Les deux flux se joignent sur `station_id`. Environ 1 500 stations.
 - **Healthcheck sur Kafka** + `depends_on: condition: service_healthy` : le producer ne démarre que lorsque le broker répond réellement.
 - **`restart: unless-stopped`** : le producer est relancé automatiquement en cas de crash imprévu.
 
+**Spark**
+- **Cluster standalone** : un `spark-master` (gestion du cluster + driver des jobs) et un `spark-worker` (2 cœurs, 2 Go pour les executors).
+- **Versions alignées** : Spark 4.0.4, connecteur `spark-sql-kafka-0-10_2.13:4.0.4` et `delta-spark_2.13:4.0.1`.
+- **Configuration centralisée** dans `config/spark-defaults.conf` (master, packages, extensions Delta), chargée automatiquement à chaque lancement.
+- **Dossier `data/` partagé** entre master et worker : le driver écrit le journal Delta, les executors écrivent les fichiers Parquet. Il est exclu de Git (les données sont générées, pas versionnées).
+
 ## Lancer le projet
 
 ```bash
 docker compose up -d --build
 ```
 
-Cette commande démarre Kafka, Kafka UI et le producer. Le topic `velib-station-status` est créé automatiquement au premier message, avec 3 partitions.
+Cette commande démarre Kafka, Kafka UI, le producer et le cluster Spark. Le topic `velib-station-status` est créé automatiquement au premier message, avec 3 partitions.
 
 | Service | Accès |
 |---|---|
 | Kafka UI | http://localhost:8085 (**Topics → velib-station-status → Messages**) |
 | Logs du producer | `docker compose logs -f producer` |
+| Spark UI (cluster) | http://localhost:9090 |
+| Spark UI (application en cours) | http://localhost:4040 |
+| Console PySpark | `docker exec -it spark-master /opt/spark/bin/pyspark` |
 
 Le producer envoie environ 1 500 messages par minute.
 
@@ -79,13 +89,16 @@ Pour tout arrêter : `docker compose down`. Les messages Kafka sont conservés d
 
 ```
 velib-data-pipeline/
-├── docker-compose.yml      # Kafka (KRaft) + Kafka UI + producer
+├── docker-compose.yml      # Kafka (KRaft) + Kafka UI + producer + Spark
+├── config/
+│   └── spark-defaults.conf # Configuration Spark (master, packages Kafka/Delta)
 ├── producer/
 │   ├── Dockerfile          # Image du producer
 │   ├── producer.py         # API Vélib' → Kafka, toutes les 60 s
 │   ├── test_keys.py        # Démonstration du partitionnement par clé
 │   └── requirements.txt
-├── spark_jobs/             # (à venir)
+├── spark_jobs/             # Jobs PySpark (à venir)
+├── data/                   # Données générées : Bronze / Silver / Gold (non versionné)
 ├── airflow/                # (à venir)
 ├── databricks/             # (à venir)
 └── docs/
@@ -93,4 +106,4 @@ velib-data-pipeline/
 
 ## Stack technique
 
-Python 3.12 · Apache Kafka 4.3 (KRaft) · confluent-kafka · Docker Compose · *à venir : Apache Spark, Apache Airflow, Databricks, Delta Lake*
+Python 3.12 · Apache Kafka 4.3 (KRaft) · confluent-kafka · Apache Spark 4.0 (PySpark) · Delta Lake 4.0 · Docker Compose · *à venir : Apache Airflow, Databricks*
