@@ -45,7 +45,7 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - [x] Exploration des données Kafka avec PySpark (data profiling)
 - [x] Spark Structured Streaming Kafka → Bronze (Delta Lake, checkpoint, exactly-once), en service permanent
 - [x] Spark batch Bronze → Silver (parsing, typage, aplatissement, broadcast join avec le référentiel des stations)
-- [ ] Spark batch Silver → Gold (agrégations)
+- [x] Spark batch Silver → Gold (4 tables d'indicateurs, heure de Paris, complétude des données)
 - [ ] Orchestration Airflow
 - [ ] Databricks (Delta Lake, Workflows, Dashboard)
 
@@ -96,6 +96,24 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **Partitionnement par `snapshot_date`** et **recalcul complet idempotent** (`overwrite`) : le job peut être relancé sans créer de doublons. Delta conserve les versions précédentes (*time travel*).
 - **Contrôle** : 1 790 901 relevés = 1 179 cycles × 1 519 stations, et 100 % des stations trouvées dans le référentiel.
 
+**Couche Gold (`spark_jobs/gold_velib.py`)**
+
+| Table | Question métier | Granularité |
+|---|---|---|
+| `station_hourly` | Évolution de chaque station heure par heure | station × jour × heure |
+| `hourly_profile` | Heures de pointe du réseau | heure de la journée |
+| `station_ranking` | Stations souvent vides, pleines ou hors service | station |
+| `network_daily` | Santé du réseau et **complétude des données** | jour |
+
+- **UTC jusqu'en Silver, heure de Paris en Gold** : l'heure locale est ambiguë au changement d'heure (la même minute existe deux fois). Elle n'est utilisée que dans la couche de présentation.
+- **Taux de remplissage calculé sur les seules stations en service** : une station en panne n'est pas « vide ».
+- **`data_coverage`** (cycles observés / 1 440 par jour) : un indicateur de qualité pour ne pas tirer de conclusions sur des journées incomplètes.
+
+## Premiers résultats
+
+- **L'effet colline** : les stations le plus souvent vides sont en hauteur (Porte de Ménilmontant 55 % du temps, Tourlaque - Damrémont à Montmartre 52 %, Porte de Bagnolet 50 %). Les plus souvent pleines sont dans le centre, près de la Seine (Place Alphonse Deville 41 %, Beaux-Arts - Bonaparte 37 %, Oratoire - Rivoli 34 %). Les vélos descendent les collines mais les remontent peu, d'où le besoin de régulation par camion.
+- **Limite assumée** : le pipeline tourne sur un poste personnel, éteint la nuit. La couverture ne dépasse pas 23 % d'une journée, et la pointe du matin (2h-9h) n'est pas observée. Les heures de pointe ne peuvent donc pas encore être établies de façon fiable. Il faudrait une collecte 24h/24 sur plusieurs semaines.
+
 ## Lancer le projet
 
 ```bash
@@ -120,6 +138,12 @@ Construire la couche Silver (batch, environ 2 minutes) :
 docker exec -it spark-master /opt/spark/bin/spark-submit --conf spark.cores.max=1 /opt/spark/jobs/silver_station_status.py
 ```
 
+Construire la couche Gold (batch, après Silver) :
+
+```bash
+docker exec -it spark-master /opt/spark/bin/spark-submit --conf spark.cores.max=1 /opt/spark/jobs/gold_velib.py
+```
+
 Lire les tables depuis la console PySpark :
 
 ```python
@@ -128,6 +152,10 @@ bronze.groupBy("ingestion_date").count().orderBy("ingestion_date").show()
 
 silver = spark.read.format("delta").load("/opt/spark/data/silver/station_status")
 silver.select("name", "nb_bikes", "nb_mechanical", "nb_ebike", "nb_free_docks", "is_operational", "snapshot_at").show(5)
+
+from pyspark.sql import functions as F
+ranking = spark.read.format("delta").load("/opt/spark/data/gold/station_ranking")
+ranking.orderBy(F.desc("pct_time_empty")).select("name", "pct_time_empty", "pct_time_full").show(5, truncate=False)
 ```
 
 Le producer envoie environ 1 500 messages par minute.
@@ -149,11 +177,13 @@ velib-data-pipeline/
 ├── spark_jobs/
 │   ├── explore_kafka.py    # Exploration batch du topic (volume, doublons, état des stations)
 │   ├── stream_bronze.py    # Streaming Kafka → Bronze (Delta Lake)
-│   └── silver_station_status.py  # Batch Bronze → Silver (nettoyage + broadcast join)
+│   ├── silver_station_status.py  # Batch Bronze → Silver (nettoyage + broadcast join)
+│   └── gold_velib.py       # Batch Silver → Gold (4 tables d'indicateurs)
 ├── data/                   # Données générées (non versionné)
 │   ├── bronze/station_status/       # Table Delta, partitionnée par ingestion_date
 │   ├── silver/station_status/       # Relevés nettoyés, partitionnés par snapshot_date
 │   ├── silver/station_information/  # Référentiel des stations
+│   ├── gold/                        # station_hourly, hourly_profile, station_ranking, network_daily
 │   └── checkpoints/                 # Checkpoints du streaming
 ├── airflow/                # (à venir)
 ├── databricks/             # (à venir)
