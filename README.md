@@ -29,7 +29,9 @@ Les deux flux se joignent sur `station_id`. Environ 1 500 stations.
 
 Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message perdu) :
 
-- **Seulement 3,6 % de mesures réellement nouvelles** : chaque station publie environ toutes les 28 minutes, alors que l'API est interrogée chaque minute. La couche Silver dédoublonnera sur (`station_id`, `last_reported`). La couche Bronze conserve tout, pour pouvoir rejouer les traitements.
+- **`last_reported` n'identifie pas une mesure** : il ne change en moyenne que toutes les 28 minutes, alors que le nombre de vélos change entre-temps. Sur 63 746 couples (`station_id`, `last_reported`), **48 268 regroupent des valeurs différentes**. Dédoublonner sur cette clé aurait supprimé environ **3 changements réels sur 4**. En réalité, **15,2 %** des relevés montrent un changement d'état par rapport au relevé précédent de la station.
+- **Granularité retenue en Silver** : un **relevé par station et par cycle** (`station_id`, `ingestion_time`), chaque minute étant une observation valide. Le dédoublonnage ne retire que les éventuels doublons techniques.
+- **Panne partielle de l'API** : lors de 10 cycles, le détail mécanique / électrique était vide (`[{}, {}]`). Silver met alors `nb_mechanical` et `nb_ebike` à **NULL** (inconnu) plutôt qu'à 0 (faux).
 - **Stations hors service** : 15 en maintenance et 2 non installées au dernier cycle. Elles sont conservées avec un indicateur, pour analyser les pannes, et exclues des calculs de disponibilité.
 - **Traçabilité** : le couple (`partition`, `offset`) identifie de façon unique chaque message Kafka. Il sera conservé en Bronze.
 
@@ -42,7 +44,8 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - [x] Cluster Spark (1 master + 1 worker) avec connecteur Kafka et Delta Lake
 - [x] Exploration des données Kafka avec PySpark (data profiling)
 - [x] Spark Structured Streaming Kafka → Bronze (Delta Lake, checkpoint, exactly-once), en service permanent
-- [ ] Spark batch (couches Silver / Gold)
+- [x] Spark batch Bronze → Silver (parsing, typage, aplatissement, broadcast join avec le référentiel des stations)
+- [ ] Spark batch Silver → Gold (agrégations)
 - [ ] Orchestration Airflow
 - [ ] Databricks (Delta Lake, Workflows, Dashboard)
 
@@ -84,6 +87,15 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **`maxOffsetsPerTrigger`** : au premier lancement, l'historique (1,6 million de messages) est absorbé par lots de 300 000.
 - **Service Docker dédié** (`spark-bronze-stream`) avec `restart: unless-stopped`, et limité à **1 cœur** (`spark.cores.max=1`) pour laisser des ressources aux jobs batch.
 
+**Couche Silver (`spark_jobs/silver_station_status.py`)**
+- **Parsing de `raw_json`** avec un schéma explicite (*schema-on-read*).
+- **Granularité** : un relevé par station et par cycle (`station_id`, `ingestion_time`). Seuls les doublons techniques sont retirés (voir « Ce que révèle l'exploration »).
+- **Aplatissement** du détail `[{"mechanical": n}, {"ebike": m}]` en `nb_mechanical` et `nb_ebike`. Ils valent **NULL** quand l'API renvoie un détail vide : une valeur inconnue n'est jamais remplacée par 0, qui fausserait les moyennes.
+- **Typage** : timestamps Unix convertis en `TIMESTAMP` UTC (`last_reported_at`, `snapshot_at`), indicateurs 0 / 1 convertis en booléens, et ajout de `is_operational`.
+- **Enrichissement par broadcast join** avec le référentiel `station_information` (nom, GPS, capacité, 1 519 lignes), lui-même stocké dans `silver/station_information`. La table de 1,8 million de relevés n'est pas redistribuée sur le réseau.
+- **Partitionnement par `snapshot_date`** et **recalcul complet idempotent** (`overwrite`) : le job peut être relancé sans créer de doublons. Delta conserve les versions précédentes (*time travel*).
+- **Contrôle** : 1 790 901 relevés = 1 179 cycles × 1 519 stations, et 100 % des stations trouvées dans le référentiel.
+
 ## Lancer le projet
 
 ```bash
@@ -102,11 +114,20 @@ Cette commande démarre Kafka, Kafka UI, le producer, le cluster Spark et le str
 | Logs du streaming Bronze | `docker compose logs -f spark-bronze-stream` |
 | Console PySpark | `docker exec -it spark-master /opt/spark/bin/pyspark` |
 
-Lire la table Bronze depuis la console PySpark :
+Construire la couche Silver (batch, environ 2 minutes) :
+
+```bash
+docker exec -it spark-master /opt/spark/bin/spark-submit --conf spark.cores.max=1 /opt/spark/jobs/silver_station_status.py
+```
+
+Lire les tables depuis la console PySpark :
 
 ```python
 bronze = spark.read.format("delta").load("/opt/spark/data/bronze/station_status")
 bronze.groupBy("ingestion_date").count().orderBy("ingestion_date").show()
+
+silver = spark.read.format("delta").load("/opt/spark/data/silver/station_status")
+silver.select("name", "nb_bikes", "nb_mechanical", "nb_ebike", "nb_free_docks", "is_operational", "snapshot_at").show(5)
 ```
 
 Le producer envoie environ 1 500 messages par minute.
@@ -127,9 +148,12 @@ velib-data-pipeline/
 │   └── requirements.txt
 ├── spark_jobs/
 │   ├── explore_kafka.py    # Exploration batch du topic (volume, doublons, état des stations)
-│   └── stream_bronze.py    # Streaming Kafka → Bronze (Delta Lake)
+│   ├── stream_bronze.py    # Streaming Kafka → Bronze (Delta Lake)
+│   └── silver_station_status.py  # Batch Bronze → Silver (nettoyage + broadcast join)
 ├── data/                   # Données générées (non versionné)
 │   ├── bronze/station_status/       # Table Delta, partitionnée par ingestion_date
+│   ├── silver/station_status/       # Relevés nettoyés, partitionnés par snapshot_date
+│   ├── silver/station_information/  # Référentiel des stations
 │   └── checkpoints/                 # Checkpoints du streaming
 ├── airflow/                # (à venir)
 ├── databricks/             # (à venir)
