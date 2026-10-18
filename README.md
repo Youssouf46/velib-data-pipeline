@@ -41,7 +41,7 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - [x] Conteneurisation du producer (Dockerfile + service Docker Compose)
 - [x] Cluster Spark (1 master + 1 worker) avec connecteur Kafka et Delta Lake
 - [x] Exploration des données Kafka avec PySpark (data profiling)
-- [ ] Spark Structured Streaming (couche Bronze)
+- [x] Spark Structured Streaming Kafka → Bronze (Delta Lake, checkpoint, exactly-once), en service permanent
 - [ ] Spark batch (couches Silver / Gold)
 - [ ] Orchestration Airflow
 - [ ] Databricks (Delta Lake, Workflows, Dashboard)
@@ -73,6 +73,16 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **Versions alignées** : Spark 4.0.4, connecteur `spark-sql-kafka-0-10_2.13:4.0.4` et `delta-spark_2.13:4.0.1`.
 - **Configuration centralisée** dans `config/spark-defaults.conf` (master, packages, extensions Delta), chargée automatiquement à chaque lancement.
 - **Dossier `data/` partagé** entre master et worker : le driver écrit le journal Delta, les executors écrivent les fichiers Parquet. Il est exclu de Git (les données sont générées, pas versionnées).
+- **`spark.log.level WARN`** : des logs lisibles pour tous les jobs.
+
+**Couche Bronze (`spark_jobs/stream_bronze.py`)**
+- **Structured Streaming** de Kafka vers une table **Delta Lake**, avec un micro-batch par minute.
+- **Données brutes** : le JSON est stocké tel quel (`raw_json`), sans schéma imposé (*schema-on-read*). Bronze ne casse jamais si l'API change de format, et Silver peut toujours être recalculé.
+- **Traçabilité** : `topic`, `partition` et `offset` identifient chaque message. `kafka_timestamp` et `bronze_ingested_at` permettent de mesurer la latence.
+- **Partitionnement par `ingestion_date`** : un dossier par jour, pour lire uniquement les dates utiles.
+- **Exactly-once** : la source est rejouable (offsets Kafka), le checkpoint enregistre l'intention (`offsets/`) et la validation (`commits/`) de chaque micro-batch, et Delta garantit des écritures atomiques et idempotentes. C'est vérifié après plusieurs arrêts brutaux : autant de couples (`partition`, `offset`) distincts que de lignes, et un batch planifié mais non validé rejoué à l'identique au redémarrage.
+- **`maxOffsetsPerTrigger`** : au premier lancement, l'historique (1,6 million de messages) est absorbé par lots de 300 000.
+- **Service Docker dédié** (`spark-bronze-stream`) avec `restart: unless-stopped`, et limité à **1 cœur** (`spark.cores.max=1`) pour laisser des ressources aux jobs batch.
 
 ## Lancer le projet
 
@@ -80,15 +90,24 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 docker compose up -d --build
 ```
 
-Cette commande démarre Kafka, Kafka UI, le producer et le cluster Spark. Le topic `velib-station-status` est créé automatiquement au premier message, avec 3 partitions.
+Cette commande démarre Kafka, Kafka UI, le producer, le cluster Spark et le streaming vers Bronze. Le topic `velib-station-status` est créé automatiquement au premier message, avec 3 partitions.
 
 | Service | Accès |
 |---|---|
 | Kafka UI | http://localhost:8085 (**Topics → velib-station-status → Messages**) |
 | Logs du producer | `docker compose logs -f producer` |
 | Spark UI (cluster) | http://localhost:9090 |
-| Spark UI (application en cours) | http://localhost:4040 |
+| Spark UI (jobs lancés depuis le master) | http://localhost:4040 |
+| Spark UI du streaming Bronze | http://localhost:4041 (onglet **Structured Streaming**) |
+| Logs du streaming Bronze | `docker compose logs -f spark-bronze-stream` |
 | Console PySpark | `docker exec -it spark-master /opt/spark/bin/pyspark` |
+
+Lire la table Bronze depuis la console PySpark :
+
+```python
+bronze = spark.read.format("delta").load("/opt/spark/data/bronze/station_status")
+bronze.groupBy("ingestion_date").count().orderBy("ingestion_date").show()
+```
 
 Le producer envoie environ 1 500 messages par minute.
 
@@ -98,7 +117,7 @@ Pour tout arrêter : `docker compose down`. Les messages Kafka sont conservés d
 
 ```
 velib-data-pipeline/
-├── docker-compose.yml      # Kafka (KRaft) + Kafka UI + producer + Spark
+├── docker-compose.yml      # Kafka (KRaft) + Kafka UI + producer + Spark + streaming Bronze
 ├── config/
 │   └── spark-defaults.conf # Configuration Spark (master, packages Kafka/Delta)
 ├── producer/
@@ -107,8 +126,11 @@ velib-data-pipeline/
 │   ├── test_keys.py        # Démonstration du partitionnement par clé
 │   └── requirements.txt
 ├── spark_jobs/
-│   └── explore_kafka.py    # Exploration batch du topic (volume, doublons, état des stations)
-├── data/                   # Données générées : Bronze / Silver / Gold (non versionné)
+│   ├── explore_kafka.py    # Exploration batch du topic (volume, doublons, état des stations)
+│   └── stream_bronze.py    # Streaming Kafka → Bronze (Delta Lake)
+├── data/                   # Données générées (non versionné)
+│   ├── bronze/station_status/       # Table Delta, partitionnée par ingestion_date
+│   └── checkpoints/                 # Checkpoints du streaming
 ├── airflow/                # (à venir)
 ├── databricks/             # (à venir)
 └── docs/

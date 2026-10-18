@@ -89,6 +89,23 @@ services:
       - ./data:/opt/spark/data
     depends_on:
       - spark-master
+  
+  spark-bronze-stream:
+    image: apache/spark:4.0.4-python3
+    container_name: spark-bronze-stream
+    command: ["/opt/spark/bin/spark-submit", "--conf", "spark.cores.max=1", "/opt/spark/jobs/stream_bronze.py"]
+    ports:
+      - "4041:4040"   # Spark UI du streaming (onglet Structured Streaming)
+    volumes:
+      - ./spark_jobs:/opt/spark/jobs
+      - ./data:/opt/spark/data
+      - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    depends_on:
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    restart: unless-stopped
 
 
 volumes:                                       
