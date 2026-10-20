@@ -46,7 +46,8 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - [x] Spark Structured Streaming Kafka → Bronze (Delta Lake, checkpoint, exactly-once), en service permanent
 - [x] Spark batch Bronze → Silver (parsing, typage, aplatissement, broadcast join avec le référentiel des stations)
 - [x] Spark batch Silver → Gold (4 tables d'indicateurs, heure de Paris, complétude des données)
-- [ ] Orchestration Airflow
+- [x] Airflow 3.3 déployé dans Docker Compose (LocalExecutor + PostgreSQL)
+- [ ] DAG quotidien Silver → Gold orchestré par Airflow
 - [ ] Databricks (Delta Lake, Workflows, Dashboard)
 
 ## Choix de conception
@@ -109,6 +110,15 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **Taux de remplissage calculé sur les seules stations en service** : une station en panne n'est pas « vide ».
 - **`data_coverage`** (cycles observés / 1 440 par jour) : un indicateur de qualité pour ne pas tirer de conclusions sur des journées incomplètes.
 
+**Airflow (orchestration)**
+- **Airflow 3.3 en `LocalExecutor`** : les tâches s'exécutent dans le conteneur du scheduler. Pas besoin de Celery ni de Redis à cette échelle.
+- **Un conteneur par composant** : `airflow-apiserver` (interface web + API utilisée par les tâches), `airflow-scheduler`, `airflow-dag-processor` (lecture des DAGs) et `airflow-triggerer` (tâches différées). La base de métadonnées est un **PostgreSQL** dédié (`airflow-postgres`) avec un volume persistant, non exposé hors du réseau Docker.
+- **`airflow-init`** : un conteneur éphémère crée les tables et le compte admin, puis s'arrête. Les autres services attendent qu'il se termine sans erreur (`service_completed_successfully`). Il est idempotent : le relancer ne change rien.
+- **Configuration factorisée** : une ancre YAML (`x-airflow-common`) partage l'image, les réglages et les dossiers entre les 5 services Airflow.
+- **Secrets hors du code** : la clé JWT (authentification entre composants), la clé Fernet (chiffrement des connexions) et le compte admin sont dans un fichier `.env`, exclu de Git.
+- **DAGs en pause à leur création** et exemples d'Airflow désactivés.
+- **Spark lancé par `DockerOperator`** *(choix retenu pour la suite)* : les conteneurs Spark sont en Python 3.10, alors que le provider Spark d'Airflow exige Python 3.11 ou plus. Or le driver PySpark doit avoir la même version de Python que les executors. Airflow lancera donc un conteneur Spark éphémère, avec la même image que le cluster, pour chaque job. Airflow orchestre, Spark calcule.
+
 ## Premiers résultats
 
 - **L'effet colline** : les stations le plus souvent vides sont en hauteur (Porte de Ménilmontant 55 % du temps, Tourlaque - Damrémont à Montmartre 52 %, Porte de Bagnolet 50 %). Les plus souvent pleines sont dans le centre, près de la Seine (Place Alphonse Deville 41 %, Beaux-Arts - Bonaparte 37 %, Oratoire - Rivoli 34 %). Les vélos descendent les collines mais les remontent peu, d'où le besoin de régulation par camion.
@@ -116,11 +126,23 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 
 ## Lancer le projet
 
+Créer d'abord un fichier `.env` à la racine du projet (il n'est pas versionné) :
+
+```
+AIRFLOW_UID=50000
+AIRFLOW_ADMIN_USER=admin
+AIRFLOW_ADMIN_PASSWORD=<mot de passe>
+AIRFLOW_JWT_SECRET=<python -c "import secrets; print(secrets.token_urlsafe(32))">
+AIRFLOW_FERNET_KEY=<python -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())">
+```
+
+Puis :
+
 ```bash
 docker compose up -d --build
 ```
 
-Cette commande démarre Kafka, Kafka UI, le producer, le cluster Spark et le streaming vers Bronze. Le topic `velib-station-status` est créé automatiquement au premier message, avec 3 partitions.
+Cette commande démarre Kafka, Kafka UI, le producer, le cluster Spark, le streaming vers Bronze et Airflow. Le topic `velib-station-status` est créé automatiquement au premier message, avec 3 partitions.
 
 | Service | Accès |
 |---|---|
@@ -131,6 +153,8 @@ Cette commande démarre Kafka, Kafka UI, le producer, le cluster Spark et le str
 | Spark UI du streaming Bronze | http://localhost:4041 (onglet **Structured Streaming**) |
 | Logs du streaming Bronze | `docker compose logs -f spark-bronze-stream` |
 | Console PySpark | `docker exec -it spark-master /opt/spark/bin/pyspark` |
+| Airflow | http://localhost:8080 (compte défini dans `.env`) |
+| Santé d'Airflow | http://localhost:8080/api/v2/monitor/health |
 
 Construire la couche Silver (batch, environ 2 minutes) :
 
@@ -166,7 +190,8 @@ Pour tout arrêter : `docker compose down`. Les messages Kafka sont conservés d
 
 ```
 velib-data-pipeline/
-├── docker-compose.yml      # Kafka (KRaft) + Kafka UI + producer + Spark + streaming Bronze
+├── .env                    # Secrets Airflow (non versionné)
+├── docker-compose.yml      # Kafka (KRaft) + Kafka UI + producer + Spark + streaming Bronze + Airflow
 ├── config/
 │   └── spark-defaults.conf # Configuration Spark (master, packages Kafka/Delta)
 ├── producer/
@@ -185,11 +210,13 @@ velib-data-pipeline/
 │   ├── silver/station_information/  # Référentiel des stations
 │   ├── gold/                        # station_hourly, hourly_profile, station_ranking, network_daily
 │   └── checkpoints/                 # Checkpoints du streaming
-├── airflow/                # (à venir)
+├── airflow/
+│   ├── dags/               # DAGs Airflow (à venir)
+│   └── logs/               # Logs des tâches (non versionné)
 ├── databricks/             # (à venir)
 └── docs/
 ```
 
 ## Stack technique
 
-Python 3.12 · Apache Kafka 4.3 (KRaft) · confluent-kafka · Apache Spark 4.0 (PySpark) · Delta Lake 4.0 · Docker Compose · *à venir : Apache Airflow, Databricks*
+Python 3.12 · Apache Kafka 4.3 (KRaft) · confluent-kafka · Apache Spark 4.0 (PySpark) · Delta Lake 4.0 · Apache Airflow 3.3 · PostgreSQL 16 · Docker Compose · *à venir : Databricks*
