@@ -47,7 +47,8 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - [x] Spark batch Bronze → Silver (parsing, typage, aplatissement, broadcast join avec le référentiel des stations)
 - [x] Spark batch Silver → Gold (4 tables d'indicateurs, heure de Paris, complétude des données)
 - [x] Airflow 3.3 déployé dans Docker Compose (LocalExecutor + PostgreSQL)
-- [ ] DAG quotidien Silver → Gold orchestré par Airflow
+- [x] DAG `velib_daily` : Airflow lance les jobs Spark Silver → Gold (`DockerOperator`)
+- [ ] Traitement incrémental par date et planification quotidienne
 - [ ] Databricks (Delta Lake, Workflows, Dashboard)
 
 ## Choix de conception
@@ -117,7 +118,9 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **Configuration factorisée** : une ancre YAML (`x-airflow-common`) partage l'image, les réglages et les dossiers entre les 5 services Airflow.
 - **Secrets hors du code** : la clé JWT (authentification entre composants), la clé Fernet (chiffrement des connexions) et le compte admin sont dans un fichier `.env`, exclu de Git.
 - **DAGs en pause à leur création** et exemples d'Airflow désactivés.
-- **Spark lancé par `DockerOperator`** *(choix retenu pour la suite)* : les conteneurs Spark sont en Python 3.10, alors que le provider Spark d'Airflow exige Python 3.11 ou plus. Or le driver PySpark doit avoir la même version de Python que les executors. Airflow lancera donc un conteneur Spark éphémère, avec la même image que le cluster, pour chaque job. Airflow orchestre, Spark calcule.
+- **Spark lancé par `DockerOperator`** : les conteneurs Spark sont en Python 3.10, alors que le provider Spark d'Airflow exige Python 3.11 ou plus. Or le driver PySpark doit avoir la même version de Python que les executors. Pour chaque job, Airflow lance donc un **conteneur Spark éphémère**, avec la même image que le cluster, qui fait le `spark-submit`. Airflow orchestre, Spark calcule.
+- **DAG `velib_daily`** (`airflow/dags/velib_daily.py`) : `build_silver >> build_gold`. Gold ne démarre que si Silver a réussi. Chaque tâche a un retry après 5 minutes. Les logs de Spark sont visibles dans Airflow. Le conteneur est supprimé en cas de succès (`auto_remove="success"`) et conservé en cas d'échec, pour le diagnostic. Premier run : 6 min 47 s (Silver environ 5 min pour 2,36 millions de relevés, Gold environ 1 min 30).
+- **Accès à Docker** : le socket `/var/run/docker.sock` est monté dans les conteneurs Airflow, et le chemin du projet sur la machine hôte (`VELIB_HOST_DIR`) leur est transmis, car c'est le démon Docker de l'hôte qui monte `data/` et `spark_jobs/` dans les conteneurs Spark. Ce socket donne des droits étendus sur la machine : acceptable en local. En production, on utiliserait plutôt `KubernetesPodOperator`.
 
 ## Premiers résultats
 
@@ -134,6 +137,7 @@ AIRFLOW_ADMIN_USER=admin
 AIRFLOW_ADMIN_PASSWORD=<mot de passe>
 AIRFLOW_JWT_SECRET=<python -c "import secrets; print(secrets.token_urlsafe(32))">
 AIRFLOW_FERNET_KEY=<python -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())">
+VELIB_HOST_DIR=<chemin absolu du projet, avec des / (ex. C:/Users/.../velib-data-pipeline)>
 ```
 
 Puis :
@@ -156,7 +160,9 @@ Cette commande démarre Kafka, Kafka UI, le producer, le cluster Spark, le strea
 | Airflow | http://localhost:8080 (compte défini dans `.env`) |
 | Santé d'Airflow | http://localhost:8080/api/v2/monitor/health |
 
-Construire la couche Silver (batch, environ 2 minutes) :
+Construire Silver puis Gold avec Airflow : dans http://localhost:8080, ouvrir le DAG **`velib_daily`** et cliquer sur **Déclencher**.
+
+Ou lancer les jobs à la main. Construire la couche Silver (batch, environ 5 minutes) :
 
 ```bash
 docker exec -it spark-master /opt/spark/bin/spark-submit --conf spark.cores.max=1 /opt/spark/jobs/silver_station_status.py
@@ -212,7 +218,8 @@ velib-data-pipeline/
 │   └── checkpoints/                 # Checkpoints du streaming
 ├── airflow/
 │   ├── dags/
-│   │   └── hello_velib.py  # DAG d'apprentissage (3 tâches Bash, retries)
+│   │   ├── hello_velib.py  # DAG d'apprentissage (3 tâches Bash, retries)
+│   │   └── velib_daily.py  # Silver → Gold sur le cluster Spark (DockerOperator)
 │   └── logs/               # Logs des tâches (non versionné)
 ├── databricks/             # (à venir)
 └── docs/

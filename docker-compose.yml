@@ -11,9 +11,14 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    # Chemin du projet sur Windows : utilisé pour monter data/ et spark_jobs/ dans les conteneurs Spark
+    VELIB_HOST_DIR: ${VELIB_HOST_DIR}
+
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
+    - /var/run/docker.sock:/var/run/docker.sock   # Airflow peut lancer des conteneurs (DockerOperator)
+
 
 
 services:
