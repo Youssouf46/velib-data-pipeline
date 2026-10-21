@@ -5,13 +5,16 @@ import pendulum
 from docker.types import Mount
 
 from airflow.providers.docker.operators.docker import DockerOperator
-from airflow.sdk import DAG
+from airflow.sdk import DAG, CronDataIntervalTimetable
 
 # Chemin du projet sur la machine hôte : c'est Docker (sur Windows) qui fait les montages
 HOST_DIR = os.environ["VELIB_HOST_DIR"]
 
 SPARK_IMAGE = "apache/spark:4.0.4-python3"   # la même image que le cluster : versions alignées
 SPARK_SUBMIT = "/opt/spark/bin/spark-submit --conf spark.cores.max=1"
+
+# Jour traité par le run = le début de sa période (Jinja : remplacé par Airflow au lancement)
+DAY = "{{ data_interval_start | ds }}"
 
 SPARK_MOUNTS = [
     Mount(source=f"{HOST_DIR}/spark_jobs", target="/opt/spark/jobs", type="bind", read_only=True),
@@ -22,11 +25,11 @@ SPARK_MOUNTS = [
 
 
 def spark_job(task_id, script):
-    """Tâche Airflow qui lance un job Spark dans un conteneur éphémère."""
+    """Tâche Airflow qui lance un job Spark dans un conteneur éphémère, pour le jour du run."""
     return DockerOperator(
         task_id=task_id,
         image=SPARK_IMAGE,
-        command=f"{SPARK_SUBMIT} /opt/spark/jobs/{script}",
+        command=f"{SPARK_SUBMIT} /opt/spark/jobs/{script} --date {DAY}",
         mounts=SPARK_MOUNTS,
         network_mode="velib-data-pipeline_default",   # pour joindre spark-master:7077
         docker_url="unix://var/run/docker.sock",
@@ -37,9 +40,12 @@ def spark_job(task_id, script):
 
 with DAG(
     dag_id="velib_daily",
-    schedule=None,   
-    start_date=pendulum.datetime(2026, 10, 18, tz="UTC"),
-    catchup=False,
+    # Période déclarée explicitement : le run du 20/10 traite [20/10 00:00 ; 21/10 00:00[ (UTC)
+    # et démarre le 21/10 à 00:00. Sans ça, Airflow 3 ne donne pas de période (voir fiche, Q4)
+    schedule=CronDataIntervalTimetable("0 0 * * *", timezone="UTC"),
+    start_date=pendulum.datetime(2026, 10, 11, tz="UTC"),   # premier jour de données
+    catchup=False,       # les jours passés sont rattrapés par un backfill lancé à la main
+    max_active_runs=1,   # un jour après l'autre : Gold du jour J lit aussi le Silver de J-1
     default_args={"retries": 1, "retry_delay": pendulum.duration(minutes=5)},
     tags=["velib", "spark"],
 ) as dag:

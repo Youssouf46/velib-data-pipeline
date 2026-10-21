@@ -1,4 +1,6 @@
-"""Batch Bronze → Silver : relevés de stations nettoyés, typés et enrichis."""
+"""Batch Bronze → Silver : relevés de stations nettoyés, typés et enrichis, pour UNE journée (UTC)."""
+import argparse
+import datetime as dt
 import json
 import urllib.request
 
@@ -57,14 +59,30 @@ def bikes_of_type(bike_type):
     )
 
 
-spark = SparkSession.builder.appName("silver-station-status").getOrCreate()
+def parse_day():
+    """Lit le jour à traiter : --date AAAA-MM-JJ (jour UTC)."""
+    parser = argparse.ArgumentParser(description="Bronze → Silver pour une journée")
+    parser.add_argument("--date", required=True, help="jour à traiter, format AAAA-MM-JJ (UTC)")
+    return dt.date.fromisoformat(parser.parse_args().date)
+
+
+day = parse_day()
+next_day = day + dt.timedelta(days=1)
+
+spark = SparkSession.builder.appName(f"silver-station-status-{day}").getOrCreate()
+
 
 # 1) Référentiel des stations → table Silver dédiée
 station_information = fetch_station_information(spark)
 station_information.write.format("delta").mode("overwrite").save(SILVER_INFO_PATH)
 
 # 2) Bronze → parsing du JSON brut
-bronze = spark.read.format("delta").load(BRONZE_PATH)
+# Partitions du jour ET du lendemain : un relevé de 23:59 peut arriver dans Kafka après minuit
+bronze = (
+    spark.read.format("delta").load(BRONZE_PATH)
+    .filter(F.col("ingestion_date").between(F.lit(day), F.lit(next_day)))   # partition pruning
+)
+
 parsed = (
     bronze.select(F.from_json("raw_json", STATUS_SCHEMA).alias("s"), "partition", "offset")
     .select("s.*", "partition", "offset")
@@ -100,10 +118,20 @@ silver = (
         "station_id",
         "left",
     )
+     .filter(F.col("snapshot_date") == F.lit(day))   # on ne garde que le jour demandé
 )
 
-# 4) Écriture : recalcul complet, partitionné par jour
-silver.write.format("delta").mode("overwrite").partitionBy("snapshot_date").save(SILVER_STATUS_PATH)
 
-print(f"Silver écrit : {spark.read.format('delta').load(SILVER_STATUS_PATH).count()} relevés")
+# 4) Écriture : remplace UNIQUEMENT la partition du jour (idempotent, les autres jours ne bougent pas)
+(
+    silver.write.format("delta")
+    .mode("overwrite")
+    .option("replaceWhere", f"snapshot_date = '{day}'")
+    .partitionBy("snapshot_date")
+    .save(SILVER_STATUS_PATH)
+)
+
+nb_rows = spark.read.format("delta").load(SILVER_STATUS_PATH).filter(F.col("snapshot_date") == F.lit(day)).count()
+print(f"Silver écrit pour le {day} : {nb_rows} relevés")
+
 spark.stop()

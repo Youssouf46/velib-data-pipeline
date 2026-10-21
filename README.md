@@ -48,7 +48,7 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - [x] Spark batch Silver → Gold (4 tables d'indicateurs, heure de Paris, complétude des données)
 - [x] Airflow 3.3 déployé dans Docker Compose (LocalExecutor + PostgreSQL)
 - [x] DAG `velib_daily` : Airflow lance les jobs Spark Silver → Gold (`DockerOperator`)
-- [ ] Traitement incrémental par date et planification quotidienne
+- [x] Traitement incrémental par date (`replaceWhere`), planification quotidienne et backfill des jours passés
 - [ ] Databricks (Delta Lake, Workflows, Dashboard)
 
 ## Choix de conception
@@ -95,7 +95,8 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **Aplatissement** du détail `[{"mechanical": n}, {"ebike": m}]` en `nb_mechanical` et `nb_ebike`. Ils valent **NULL** quand l'API renvoie un détail vide : une valeur inconnue n'est jamais remplacée par 0, qui fausserait les moyennes.
 - **Typage** : timestamps Unix convertis en `TIMESTAMP` UTC (`last_reported_at`, `snapshot_at`), indicateurs 0 / 1 convertis en booléens, et ajout de `is_operational`.
 - **Enrichissement par broadcast join** avec le référentiel `station_information` (nom, GPS, capacité, 1 519 lignes), lui-même stocké dans `silver/station_information`. La table de 1,8 million de relevés n'est pas redistribuée sur le réseau.
-- **Partitionnement par `snapshot_date`** et **recalcul complet idempotent** (`overwrite`) : le job peut être relancé sans créer de doublons. Delta conserve les versions précédentes (*time travel*).
+- **Traitement incrémental** : le job reçoit une journée UTC (`--date AAAA-MM-JJ`, obligatoire). Il lit seulement les partitions Bronze **du jour et du lendemain** (*partition pruning*), car un relevé de 23:59 peut arriver dans Kafka après minuit, puis garde `snapshot_date` = le jour demandé.
+- **Écriture idempotente** : `overwrite` + `replaceWhere` remplace **uniquement** la partition du jour. Relancer un jour donne le même résultat (vérifié : 116 809 relevés pour le 20/10, deux fois de suite), sans toucher aux autres jours. Un jour sans données (PC éteint) donne 0 relevé, sans erreur.
 - **Contrôle** : 1 790 901 relevés = 1 179 cycles × 1 519 stations, et 100 % des stations trouvées dans le référentiel.
 
 **Couche Gold (`spark_jobs/gold_velib.py`)**
@@ -103,9 +104,14 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 | Table | Question métier | Granularité |
 |---|---|---|
 | `station_hourly` | Évolution de chaque station heure par heure | station × jour × heure |
+| `station_daily` | Comptes journaliers par station (relevés, en service, vide, pleine) | station × jour |
+| `network_daily` | Santé du réseau et **complétude des données** | jour |
 | `hourly_profile` | Heures de pointe du réseau | heure de la journée |
 | `station_ranking` | Stations souvent vides, pleines ou hors service | station |
-| `network_daily` | Santé du réseau et **complétude des données** | jour |
+
+- **Traitement incrémental par jour de Paris** (`--date`) : une journée de Paris commence la veille en UTC (22h ou 23h). Le job lit donc les partitions Silver de la veille et du jour, puis remplace uniquement ce jour (`replaceWhere`) dans `station_hourly`, `station_daily` et `network_daily`.
+- **Indicateurs sur tout l'historique calculés à partir de comptes additifs** : `station_ranking` additionne les comptes de `station_daily`, et `hourly_profile` fait une moyenne pondérée de `station_hourly`. Gold ne relit jamais tout Silver, et on ne calcule jamais une moyenne de moyennes (50 % sur 100 relevés et 10 % sur 900 relevés donnent 14 %, pas 30 %).
+- **`try_divide`** : une division par zéro (station jamais en service) donne NULL au lieu de faire planter le job (Spark 4 est en mode ANSI).
 
 - **UTC jusqu'en Silver, heure de Paris en Gold** : l'heure locale est ambiguë au changement d'heure (la même minute existe deux fois). Elle n'est utilisée que dans la couche de présentation.
 - **Taux de remplissage calculé sur les seules stations en service** : une station en panne n'est pas « vide ».
@@ -119,12 +125,15 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **Secrets hors du code** : la clé JWT (authentification entre composants), la clé Fernet (chiffrement des connexions) et le compte admin sont dans un fichier `.env`, exclu de Git.
 - **DAGs en pause à leur création** et exemples d'Airflow désactivés.
 - **Spark lancé par `DockerOperator`** : les conteneurs Spark sont en Python 3.10, alors que le provider Spark d'Airflow exige Python 3.11 ou plus. Or le driver PySpark doit avoir la même version de Python que les executors. Pour chaque job, Airflow lance donc un **conteneur Spark éphémère**, avec la même image que le cluster, qui fait le `spark-submit`. Airflow orchestre, Spark calcule.
-- **DAG `velib_daily`** (`airflow/dags/velib_daily.py`) : `build_silver >> build_gold`. Gold ne démarre que si Silver a réussi. Chaque tâche a un retry après 5 minutes. Les logs de Spark sont visibles dans Airflow. Le conteneur est supprimé en cas de succès (`auto_remove="success"`) et conservé en cas d'échec, pour le diagnostic. Premier run : 6 min 47 s (Silver environ 5 min pour 2,36 millions de relevés, Gold environ 1 min 30).
+- **DAG `velib_daily`** (`airflow/dags/velib_daily.py`) : `build_silver >> build_gold`. Gold ne démarre que si Silver a réussi. Chaque tâche a un retry après 5 minutes. Les logs de Spark sont visibles dans Airflow. Le conteneur est supprimé en cas de succès (`auto_remove="success"`) et conservé en cas d'échec, pour le diagnostic. Les deux jobs reçoivent la date du run : `--date {{ data_interval_start | ds }}`.
+- **Planification explicite** : `CronDataIntervalTimetable("0 0 * * *", timezone="UTC")`. Chaque nuit à minuit UTC, le run traite **la veille**, avec une vraie période [J ; J+1[. Avec `@daily`, Airflow 3 utiliserait par défaut l'heure de déclenchement comme date logique, sans période, et traiterait donc le jour qui commence.
+- **`max_active_runs=1`** : les jours sont traités l'un après l'autre, car Gold du jour J lit aussi le Silver de J-1.
+- **Backfill** : `catchup=False`, et les jours passés (11 → 19/10) ont été reconstruits par un backfill lancé depuis l'interface (1 run actif à la fois). Les 10 runs ont réussi, en 4 à 8 minutes chacun. Aucun cycle n'est perdu : chaque station totalise 1 551 relevés dans Gold, comme dans Silver.
 - **Accès à Docker** : le socket `/var/run/docker.sock` est monté dans les conteneurs Airflow, et le chemin du projet sur la machine hôte (`VELIB_HOST_DIR`) leur est transmis, car c'est le démon Docker de l'hôte qui monte `data/` et `spark_jobs/` dans les conteneurs Spark. Ce socket donne des droits étendus sur la machine : acceptable en local. En production, on utiliserait plutôt `KubernetesPodOperator`.
 
 ## Premiers résultats
 
-- **L'effet colline** : les stations le plus souvent vides sont en hauteur (Porte de Ménilmontant 55 % du temps, Tourlaque - Damrémont à Montmartre 52 %, Porte de Bagnolet 50 %). Les plus souvent pleines sont dans le centre, près de la Seine (Place Alphonse Deville 41 %, Beaux-Arts - Bonaparte 37 %, Oratoire - Rivoli 34 %). Les vélos descendent les collines mais les remontent peu, d'où le besoin de régulation par camion.
+- **L'effet colline** (1 551 cycles, du 11 au 21/10) : les stations le plus souvent vides sont en hauteur ou en périphérie (Gare du Nord - Saint-Vincent de Paul 53 % du temps, Tourlaque - Damrémont à Montmartre 48 %, Porte de Ménilmontant 48 %, Porte de Bagnolet 45 %). Les plus souvent pleines sont dans le centre, près de la Seine (Place Alphonse Deville 41 %, Place Saint-André des Arts 36 %, Oratoire - Rivoli 36 %). Les vélos descendent les collines mais les remontent peu, d'où le besoin de régulation par camion.
 - **Limite assumée** : le pipeline tourne sur un poste personnel, éteint la nuit. La couverture ne dépasse pas 23 % d'une journée, et la pointe du matin (2h-9h) n'est pas observée. Les heures de pointe ne peuvent donc pas encore être établies de façon fiable. Il faudrait une collecte 24h/24 sur plusieurs semaines.
 
 ## Lancer le projet
@@ -160,18 +169,18 @@ Cette commande démarre Kafka, Kafka UI, le producer, le cluster Spark, le strea
 | Airflow | http://localhost:8080 (compte défini dans `.env`) |
 | Santé d'Airflow | http://localhost:8080/api/v2/monitor/health |
 
-Construire Silver puis Gold avec Airflow : dans http://localhost:8080, ouvrir le DAG **`velib_daily`** et cliquer sur **Déclencher**.
+Silver et Gold sont construits **automatiquement chaque nuit** par le DAG **`velib_daily`** (http://localhost:8080). Pour reconstruire des jours passés : **Déclencher** → **Backfill**, avec une plage de dates et **1** exécution active.
 
-Ou lancer les jobs à la main. Construire la couche Silver (batch, environ 5 minutes) :
+Ou lancer les jobs à la main pour une journée. Construire la couche Silver (environ 2 min 30) :
 
 ```bash
-docker exec -it spark-master /opt/spark/bin/spark-submit --conf spark.cores.max=1 /opt/spark/jobs/silver_station_status.py
+docker exec -it spark-master /opt/spark/bin/spark-submit --conf spark.cores.max=1 /opt/spark/jobs/silver_station_status.py --date 2026-10-20
 ```
 
-Construire la couche Gold (batch, après Silver) :
+Construire la couche Gold (environ 1 minute, après Silver) :
 
 ```bash
-docker exec -it spark-master /opt/spark/bin/spark-submit --conf spark.cores.max=1 /opt/spark/jobs/gold_velib.py
+docker exec -it spark-master /opt/spark/bin/spark-submit --conf spark.cores.max=1 /opt/spark/jobs/gold_velib.py --date 2026-10-20
 ```
 
 Lire les tables depuis la console PySpark :
@@ -208,13 +217,13 @@ velib-data-pipeline/
 ├── spark_jobs/
 │   ├── explore_kafka.py    # Exploration batch du topic (volume, doublons, état des stations)
 │   ├── stream_bronze.py    # Streaming Kafka → Bronze (Delta Lake)
-│   ├── silver_station_status.py  # Batch Bronze → Silver (nettoyage + broadcast join)
-│   └── gold_velib.py       # Batch Silver → Gold (4 tables d'indicateurs)
+│   ├── silver_station_status.py  # Batch Bronze → Silver pour un jour (nettoyage + broadcast join)
+│   └── gold_velib.py       # Batch Silver → Gold pour un jour (5 tables d'indicateurs)
 ├── data/                   # Données générées (non versionné)
 │   ├── bronze/station_status/       # Table Delta, partitionnée par ingestion_date
 │   ├── silver/station_status/       # Relevés nettoyés, partitionnés par snapshot_date
 │   ├── silver/station_information/  # Référentiel des stations
-│   ├── gold/                        # station_hourly, hourly_profile, station_ranking, network_daily
+│   ├── gold/                        # station_hourly, station_daily, network_daily, hourly_profile, station_ranking
 │   └── checkpoints/                 # Checkpoints du streaming
 ├── airflow/
 │   ├── dags/
