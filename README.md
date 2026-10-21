@@ -211,7 +211,8 @@ velib-data-pipeline/
 │   ├── gold/                        # station_hourly, hourly_profile, station_ranking, network_daily
 │   └── checkpoints/                 # Checkpoints du streaming
 ├── airflow/
-│   ├── dags/               # DAGs Airflow (à venir)
+│   ├── dags/
+│   │   └── hello_velib.py  # DAG d'apprentissage (3 tâches Bash, retries)
 │   └── logs/               # Logs des tâches (non versionné)
 ├── databricks/             # (à venir)
 └── docs/
