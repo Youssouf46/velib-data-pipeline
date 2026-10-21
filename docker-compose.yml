@@ -18,6 +18,8 @@ x-airflow-common: &airflow-common
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
     - /var/run/docker.sock:/var/run/docker.sock   # Airflow peut lancer des conteneurs (DockerOperator)
+    - ./data/bronze:/opt/airflow/data/bronze:ro   # le sensor lit le journal Delta de Bronze
+
 
 
 
