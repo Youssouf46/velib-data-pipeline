@@ -20,6 +20,9 @@ SPARK_SUBMIT = "/opt/spark/bin/spark-submit --conf spark.cores.max=1"
 
 # Jour traité par le run = le début de sa période (Jinja : remplacé par Airflow au lancement)
 DAY = "{{ data_interval_start | ds }}"
+# Part minimale de la journée observée pour que les indicateurs soient publiés
+MIN_COVERAGE = 0.05
+
 
 SPARK_MOUNTS = [
     Mount(source=f"{HOST_DIR}/spark_jobs", target="/opt/spark/jobs", type="bind", read_only=True),
@@ -29,17 +32,19 @@ SPARK_MOUNTS = [
 ]
 
 
-def spark_job(task_id, script):
+def spark_job(task_id, script, extra_args="", **kwargs):
     """Tâche Airflow qui lance un job Spark dans un conteneur éphémère, pour le jour du run."""
     return DockerOperator(
         task_id=task_id,
         image=SPARK_IMAGE,
-        command=f"{SPARK_SUBMIT} /opt/spark/jobs/{script} --date {DAY}",
+        command=f"{SPARK_SUBMIT} /opt/spark/jobs/{script} --date {DAY} {extra_args}",
         mounts=SPARK_MOUNTS,
         network_mode="velib-data-pipeline_default",   # pour joindre spark-master:7077
         docker_url="unix://var/run/docker.sock",
         auto_remove="success",                         # supprime le conteneur s'il a réussi
         mount_tmp_dir=False,
+        **kwargs,                                      # réglages propres à une tâche (ex. retries)
+
     )
 
 
@@ -77,4 +82,8 @@ with DAG(
     silver = spark_job("build_silver", "silver_station_status.py")
     gold = spark_job("build_gold", "gold_velib.py")
 
-    wait_for_bronze() >> silver >> gold
+    # Pas de retry : un contrôle qualité qui échoue échouera encore 5 minutes plus tard
+    quality = spark_job("check_quality", "check_quality.py", f"--min-coverage {MIN_COVERAGE}", retries=0)
+
+    wait_for_bronze() >> silver >> gold >> quality
+

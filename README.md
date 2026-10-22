@@ -128,6 +128,7 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **DAG `velib_daily`** (`airflow/dags/velib_daily.py`) : `build_silver >> build_gold`. Gold ne démarre que si Silver a réussi. Chaque tâche a un retry après 5 minutes. Les logs de Spark sont visibles dans Airflow. Le conteneur est supprimé en cas de succès (`auto_remove="success"`) et conservé en cas d'échec, pour le diagnostic. Les deux jobs reçoivent la date du run : `--date {{ data_interval_start | ds }}`.
 - **Planification explicite** : `CronDataIntervalTimetable("0 0 * * *", timezone="UTC")`. Chaque nuit à minuit UTC, le run traite **la veille**, avec une vraie période [J ; J+1[. Avec `@daily`, Airflow 3 utiliserait par défaut l'heure de déclenchement comme date logique, sans période, et traiterait donc le jour qui commence.
 - **Sensor `wait_for_bronze` avant Silver** : à minuit, les relevés de 23:59 ne sont pas encore dans Bronze (le streaming écrit une fois par minute). Le sensor attend que Bronze contienne un message arrivé **après** la fin de la journée traitée. L'heure du dernier message est lue en 0,05 s dans les **statistiques du journal Delta** (`maxValues.kafka_timestamp` des derniers commits), sans lancer Spark. Bronze est monté **en lecture seule** dans Airflow. Le sensor vérifie toutes les minutes en mode `reschedule` (il libère sa place entre deux vérifications) et échoue au bout de 2 heures : si le streaming est arrêté, Silver ne calcule pas une journée incomplète.
+- **Contrôle qualité `check_quality` après Gold** (`spark_jobs/check_quality.py`) : 5 règles pour la journée traitée (présente dans Gold, couverture d'au moins 5 %, pas de doublon par station, entre 1 400 et 1 600 stations, comptes cohérents). Si une règle échoue, le job se termine avec le code 1 et la tâche Airflow échoue, avec le détail de chaque règle dans les logs. Pas de retry pour cette tâche : une journée vide le restera. Exemple : le 20/10 (1,5 % de la journée observée) est signalé en échec, le 21/10 (28,3 %) est validé.
 - **`max_active_runs=1`** : les jours sont traités l'un après l'autre, car Gold du jour J lit aussi le Silver de J-1.
 - **Backfill** : `catchup=False`, et les jours passés (11 → 19/10) ont été reconstruits par un backfill lancé depuis l'interface (1 run actif à la fois). Les 10 runs ont réussi, en 4 à 8 minutes chacun. Aucun cycle n'est perdu : chaque station totalise 1 551 relevés dans Gold, comme dans Silver.
 - **Accès à Docker** : le socket `/var/run/docker.sock` est monté dans les conteneurs Airflow, et le chemin du projet sur la machine hôte (`VELIB_HOST_DIR`) leur est transmis, car c'est le démon Docker de l'hôte qui monte `data/` et `spark_jobs/` dans les conteneurs Spark. Ce socket donne des droits étendus sur la machine : acceptable en local. En production, on utiliserait plutôt `KubernetesPodOperator`.
@@ -219,7 +220,8 @@ velib-data-pipeline/
 │   ├── explore_kafka.py    # Exploration batch du topic (volume, doublons, état des stations)
 │   ├── stream_bronze.py    # Streaming Kafka → Bronze (Delta Lake)
 │   ├── silver_station_status.py  # Batch Bronze → Silver pour un jour (nettoyage + broadcast join)
-│   └── gold_velib.py       # Batch Silver → Gold pour un jour (5 tables d'indicateurs)
+│   ├── gold_velib.py       # Batch Silver → Gold pour un jour (5 tables d'indicateurs)
+│   └── check_quality.py    # Contrôle qualité de Gold pour un jour (échoue si une règle n'est pas respectée)
 ├── data/                   # Données générées (non versionné)
 │   ├── bronze/station_status/       # Table Delta, partitionnée par ingestion_date
 │   ├── silver/station_status/       # Relevés nettoyés, partitionnés par snapshot_date
@@ -229,7 +231,7 @@ velib-data-pipeline/
 ├── airflow/
 │   ├── dags/
 │   │   ├── hello_velib.py  # DAG d'apprentissage (3 tâches Bash, retries)
-│   │   └── velib_daily.py  # Silver → Gold sur le cluster Spark (DockerOperator)
+│   │   └── velib_daily.py  # Sensor Bronze → Silver → Gold → contrôle qualité (DockerOperator)
 │   └── logs/               # Logs des tâches (non versionné)
 ├── databricks/             # (à venir)
 └── docs/
