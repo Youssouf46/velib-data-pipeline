@@ -13,6 +13,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     # Chemin du projet sur Windows : utilisé pour monter data/ et spark_jobs/ dans les conteneurs Spark
     VELIB_HOST_DIR: ${VELIB_HOST_DIR}
+    NTFY_TOPIC: ${NTFY_TOPIC}   # canal ntfy des alertes (secret, dans .env)
+
 
   volumes:
     - ./airflow/dags:/opt/airflow/dags

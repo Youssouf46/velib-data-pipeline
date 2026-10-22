@@ -2,6 +2,7 @@
 import json
 import os
 import pathlib
+import urllib.request
 
 import pendulum
 from docker.types import Mount
@@ -14,6 +15,9 @@ HOST_DIR = os.environ["VELIB_HOST_DIR"]
 
 # Journal Delta de Bronze, monté en lecture seule dans les conteneurs Airflow
 BRONZE_DELTA_LOG = pathlib.Path("/opt/airflow/data/bronze/station_status/_delta_log")
+
+# Canal ntfy des alertes : le nom du canal (dans .env) sert de mot de passe
+NTFY_URL = f"https://ntfy.sh/{os.environ['NTFY_TOPIC']}"
 
 SPARK_IMAGE = "apache/spark:4.0.4-python3"   # la même image que le cluster : versions alignées
 SPARK_SUBMIT = "/opt/spark/bin/spark-submit --conf spark.cores.max=1"
@@ -59,6 +63,21 @@ def latest_bronze_timestamp():
                 latest = max_timestamp if latest is None else max(latest, max_timestamp)
     return latest
 
+def notify_failure(context):
+    """Appelée par Airflow quand une tâche échoue définitivement : envoie une notification ntfy."""
+    ti = context["ti"]
+    message = (
+        f"La tâche {ti.task_id} a échoué pour le {context['data_interval_start']:%Y-%m-%d} "
+        f"(essai {ti.try_number}). Run : {context['dag_run'].run_id}"
+    )
+    request = urllib.request.Request(
+        NTFY_URL,
+        data=message.encode("utf-8"),
+        headers={"Title": f"Pipeline Velib : echec de {ti.dag_id}", "Priority": "high", "Tags": "warning"},
+    )
+    urllib.request.urlopen(request, timeout=10)
+
+
 
 with DAG(
     dag_id="velib_daily",
@@ -68,7 +87,12 @@ with DAG(
     start_date=pendulum.datetime(2026, 10, 11, tz="UTC"),   # premier jour de données
     catchup=False,       # les jours passés sont rattrapés par un backfill lancé à la main
     max_active_runs=1,   # un jour après l'autre : Gold du jour J lit aussi le Silver de J-1
-    default_args={"retries": 1, "retry_delay": pendulum.duration(minutes=5)},
+    default_args={
+        "retries": 1,
+        "retry_delay": pendulum.duration(minutes=5),
+        "on_failure_callback": notify_failure,   # alerte après le dernier essai
+    },
+
     tags=["velib", "spark"],
 ) as dag:
 

@@ -49,6 +49,7 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - [x] Airflow 3.3 déployé dans Docker Compose (LocalExecutor + PostgreSQL)
 - [x] DAG `velib_daily` : Airflow lance les jobs Spark Silver → Gold (`DockerOperator`)
 - [x] Traitement incrémental par date (`replaceWhere`), planification quotidienne et backfill des jours passés
+- [x] Robustesse : sensor de fraîcheur de Bronze, contrôle qualité, alertes sur téléphone (ntfy)
 - [ ] Databricks (Delta Lake, Workflows, Dashboard)
 
 ## Choix de conception
@@ -129,6 +130,7 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **Planification explicite** : `CronDataIntervalTimetable("0 0 * * *", timezone="UTC")`. Chaque nuit à minuit UTC, le run traite **la veille**, avec une vraie période [J ; J+1[. Avec `@daily`, Airflow 3 utiliserait par défaut l'heure de déclenchement comme date logique, sans période, et traiterait donc le jour qui commence.
 - **Sensor `wait_for_bronze` avant Silver** : à minuit, les relevés de 23:59 ne sont pas encore dans Bronze (le streaming écrit une fois par minute). Le sensor attend que Bronze contienne un message arrivé **après** la fin de la journée traitée. L'heure du dernier message est lue en 0,05 s dans les **statistiques du journal Delta** (`maxValues.kafka_timestamp` des derniers commits), sans lancer Spark. Bronze est monté **en lecture seule** dans Airflow. Le sensor vérifie toutes les minutes en mode `reschedule` (il libère sa place entre deux vérifications) et échoue au bout de 2 heures : si le streaming est arrêté, Silver ne calcule pas une journée incomplète.
 - **Contrôle qualité `check_quality` après Gold** (`spark_jobs/check_quality.py`) : 5 règles pour la journée traitée (présente dans Gold, couverture d'au moins 5 %, pas de doublon par station, entre 1 400 et 1 600 stations, comptes cohérents). Si une règle échoue, le job se termine avec le code 1 et la tâche Airflow échoue, avec le détail de chaque règle dans les logs. Pas de retry pour cette tâche : une journée vide le restera. Exemple : le 20/10 (1,5 % de la journée observée) est signalé en échec, le 21/10 (28,3 %) est validé.
+- **Alertes sur téléphone** : un `on_failure_callback`, déclaré dans `default_args`, envoie une notification [ntfy](https://ntfy.sh) quand une tâche échoue après son dernier essai (quelle tâche, quel jour, quel essai). Le nom du canal ntfy sert de mot de passe : il est dans `.env` (`NTFY_TOPIC`), jamais dans le code.
 - **`max_active_runs=1`** : les jours sont traités l'un après l'autre, car Gold du jour J lit aussi le Silver de J-1.
 - **Backfill** : `catchup=False`, et les jours passés (11 → 19/10) ont été reconstruits par un backfill lancé depuis l'interface (1 run actif à la fois). Les 10 runs ont réussi, en 4 à 8 minutes chacun. Aucun cycle n'est perdu : chaque station totalise 1 551 relevés dans Gold, comme dans Silver.
 - **Accès à Docker** : le socket `/var/run/docker.sock` est monté dans les conteneurs Airflow, et le chemin du projet sur la machine hôte (`VELIB_HOST_DIR`) leur est transmis, car c'est le démon Docker de l'hôte qui monte `data/` et `spark_jobs/` dans les conteneurs Spark. Ce socket donne des droits étendus sur la machine : acceptable en local. En production, on utiliserait plutôt `KubernetesPodOperator`.
@@ -149,6 +151,7 @@ AIRFLOW_ADMIN_PASSWORD=<mot de passe>
 AIRFLOW_JWT_SECRET=<python -c "import secrets; print(secrets.token_urlsafe(32))">
 AIRFLOW_FERNET_KEY=<python -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())">
 VELIB_HOST_DIR=<chemin absolu du projet, avec des / (ex. C:/Users/.../velib-data-pipeline)>
+NTFY_TOPIC=<python -c "import secrets; print('velib-' + secrets.token_hex(8))">
 ```
 
 Puis :
