@@ -50,7 +50,8 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - [x] DAG `velib_daily` : Airflow lance les jobs Spark Silver → Gold (`DockerOperator`)
 - [x] Traitement incrémental par date (`replaceWhere`), planification quotidienne et backfill des jours passés
 - [x] Robustesse : sensor de fraîcheur de Bronze, contrôle qualité, alertes sur téléphone (ntfy)
-- [ ] Databricks (Delta Lake, Workflows, Dashboard)
+- [x] Databricks : collecte 24h/24 dans le cloud, Bronze (Auto Loader), Silver, Gold et contrôle qualité orchestrés par Lakeflow Jobs
+- [ ] Databricks : dashboard et versionnement des notebooks
 
 ## Choix de conception
 
@@ -134,6 +135,29 @@ Analyse de **1 069 376 messages** (704 cycles × 1 519 stations, aucun message p
 - **`max_active_runs=1`** : les jours sont traités l'un après l'autre, car Gold du jour J lit aussi le Silver de J-1.
 - **Backfill** : `catchup=False`, et les jours passés (11 → 19/10) ont été reconstruits par un backfill lancé depuis l'interface (1 run actif à la fois). Les 10 runs ont réussi, en 4 à 8 minutes chacun. Aucun cycle n'est perdu : chaque station totalise 1 551 relevés dans Gold, comme dans Silver.
 - **Accès à Docker** : le socket `/var/run/docker.sock` est monté dans les conteneurs Airflow, et le chemin du projet sur la machine hôte (`VELIB_HOST_DIR`) leur est transmis, car c'est le démon Docker de l'hôte qui monte `data/` et `spark_jobs/` dans les conteneurs Spark. Ce socket donne des droits étendus sur la machine : acceptable en local. En production, on utiliserait plutôt `KubernetesPodOperator`.
+
+**Databricks (Free Edition, compute serverless)**
+
+L'API Vélib' est joignable depuis le serverless de Databricks. Le pipeline y est reproduit **dans le cloud**, avec une collecte **24h/24**, ce qui supprime la limite du poste personnel éteint la nuit.
+
+```
+Job velib_collect (toutes les 15 min) :  collect ──► bronze
+Job velib_daily   (chaque nuit, 00:30 UTC) :  silver ──► gold ──► quality ──(échec)──► e-mail
+```
+
+| Rôle | En local | Sur Databricks |
+|---|---|---|
+| Appeler l'API | producer Python (Docker) | notebook `01_collect_station_status`, un fichier JSON Lines par collecte |
+| Tampon | Kafka | Volume Unity Catalog `workspace.bronze.landing` |
+| Charger Bronze | Structured Streaming + checkpoint | **Auto Loader** + checkpoint, `trigger(availableNow=True)` (le serverless refuse les triggers continus) |
+| Silver / Gold / contrôle | jobs Spark + `DockerOperator` | notebooks `03` à `05`, paramètre `date` par widget, `replaceWhere` |
+| Orchestration et alertes | Airflow + callback ntfy | **Lakeflow Jobs** : dépendances, cron Quartz, retries, paramètres de job, e-mail en cas d'échec |
+| Tables | dossiers Delta | tables Unity Catalog `workspace.{bronze,silver,gold}.*`, lineage automatique |
+
+- **Collecte toutes les 15 minutes** plutôt que toutes les minutes, pour rester dans le quota quotidien de la Free Edition (environ 1 min 30 de serverless par run). `data_coverage` est donc calculée sur 96 collectes par jour.
+- **Pas de partitionnement** des tables (Databricks le déconseille sous 1 To). `replaceWhere` fonctionne sur n'importe quelle colonne.
+- **Contrôle qualité plus exigeant** : couverture minimale de 80 % (paramètre `min_coverage` du job), contre 5 % en local.
+- **Pas de `cache()`** : le serverless gère lui-même la mémoire.
 
 ## Premiers résultats
 
@@ -242,4 +266,4 @@ velib-data-pipeline/
 
 ## Stack technique
 
-Python 3.12 · Apache Kafka 4.3 (KRaft) · confluent-kafka · Apache Spark 4.0 (PySpark) · Delta Lake 4.0 · Apache Airflow 3.3 · PostgreSQL 16 · Docker Compose · *à venir : Databricks*
+Python 3.12 · Apache Kafka 4.3 (KRaft) · confluent-kafka · Apache Spark 4.0 (PySpark) · Delta Lake 4.0 · Apache Airflow 3.3 · PostgreSQL 16 · Docker Compose · Databricks (Unity Catalog, Auto Loader, Lakeflow Jobs, serverless)
